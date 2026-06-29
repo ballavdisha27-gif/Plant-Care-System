@@ -1,55 +1,140 @@
-# ESP32 Smart Plant Care System
+🌱 ESP32 Smart Plant Care System
 
-## Software Setup
-1. Install Arduino IDE
-2. Copy secrets_example.h and rename it to secrets.h
-3. Fill in your WiFi and Blynk credentials in secrets.h
-4. Open plantcaresystem.ino in Arduino IDE
-5. Select Board: ESP32 Dev Module
-6. Click Upload
+Author
 
-## Libraries to Install
-Open Arduino IDE → Tools → Manage Libraries → Search and install:
-- DHT sensor library by Adafruit
-- BH1750 by Christopher Laws
-- Blynk by Volodymyr Shymanskyy
-- SD by Arduino
+Disha Ballav Mondal
 
-## Hardware Pins
-| Pin | Component |
-|-----|-----------|
-| 26  | Relay Module |
-| 4   | Buzzer |
-| 34  | Soil Moisture Sensor |
-| 15  | DHT22 |
-| 5   | SD Card CS |
-| 35  | Water Level Sensor |
-| SDA/SCL | BH1750 Light Sensor |
+Project Overview
 
-## Blynk Dashboard Setup
-| Virtual Pin | Widget | Name |
-|-------------|--------|------|
-| V0 | Gauge | Soil Moisture |
-| V1 | Gauge | Temperature |
-| V2 | Gauge | Humidity |
-| V3 | Gauge | Light |
-| V4 | Gauge | Health Score |
-| V5 | LED | Pump Status |
-| V7 | Gauge | Water Level |
-| V8 | Segmented Switch | Plant Type |
-| V9 | Label | Care Tips |
-| V10 | Button | System Reset |
-| V11 | Label | System Status |
+The ESP32 Smart Plant Care System is an IoT-based automatic plant monitoring and watering system. It continuously monitors soil moisture, temperature, humidity, light intensity, and water level, then automatically controls a servo-operated water valve to irrigate plants when required. The system also logs sensor data to an SD card and provides real-time monitoring through the Blynk IoT platform.
 
-## Plant Types
-| Number | Plant |
-|--------|-------|
-| 1 | Cactus / Succulent |
-| 2 | Tropical Plant |
-| 3 | Vegetable / Herb |
-| 4 | General / Default |
+---
 
-## Notes
-- Blynk Template ID: TMPL34YaDTWgj
-- Scheduled watering time: 7:00 AM daily
-- Data logged to SD card as /plantdata.csv
+Features
+
+- 🌱 Automatic plant watering using Servo Motor
+- 📊 Real-time monitoring of:
+  - Soil Moisture
+  - Temperature
+  - Humidity
+  - Light Intensity
+  - Water Tank Level
+- 📱 Blynk IoT dashboard
+- 💾 SD Card data logging
+- 🌐 Wi-Fi auto reconnect
+- 🔄 Dual-core FreeRTOS multitasking
+- 🛡 ESP32 Hardware Watchdog protection
+- 📉 Exponential Moving Average (EMA) sensor filtering
+- 🚨 Sensor fault detection
+- 🔒 Automatic valve safety lock
+- ⏱ Automatic timeout protection
+- 🌿 Multiple plant profiles
+- 📡 Real-time cloud synchronization
+
+---
+
+Hardware Used
+
+- ESP32 DevKit V1
+- DHT22 Sensor
+- BH1750 Light Sensor
+- Capacitive Soil Moisture Sensor
+- Water Level Sensor
+- Servo Motor
+- SD Card Module
+- Breadboard
+- Jumper Wires
+
+---
+
+Software Used
+
+- Arduino IDE
+- Blynk IoT
+- ESP32 Arduino Core
+- C++
+
+---
+
+Libraries
+
+- DHT
+- BH1750
+- WiFi
+- Blynk
+- SD
+- SPI
+- Wire
+- Time
+- ESP Task Watchdog
+
+---
+
+GPIO Connections
+
+GPIO| Device
+GPIO 26| Servo Motor
+GPIO 34| Soil Moisture Sensor
+GPIO 35| Water Level Sensor
+GPIO 15| DHT22
+GPIO 21| SDA (BH1750)
+GPIO 22| SCL (BH1750)
+GPIO 5| SD Card CS
+GPIO 4| Buzzer
+
+---
+
+System Workflow
+
+1. Read all sensors.
+2. Filter sensor values using EMA.
+3. Check for sensor faults.
+4. Compare readings with plant thresholds.
+5. Open servo valve if watering is needed.
+6. Close valve after timeout or sufficient moisture.
+7. Log data to SD card.
+8. Upload data to Blynk dashboard.
+9. Continue monitoring continuously.
+
+---
+
+Safety Features
+
+- Hardware Watchdog
+- Automatic Valve Lock
+- Water Level Protection
+- Sensor Failure Detection
+- Servo Timeout Protection
+- Wi-Fi Auto Reconnect
+- SD Card Error Detection
+
+---
+
+Project Structure
+
+Plant-Care-System/
+│
+├── plantcaresystem.ino
+├── secrets.h
+├── README.md
+├── PRD.md
+├── SCHEMA.md
+├── DATA_FLOW.md
+└── DESIGN.md
+
+---
+
+Future Improvements
+
+- Camera monitoring
+- AI-based plant disease detection
+- Solar power support
+- Multiple plant support
+- Mobile notifications
+- Voice assistant integration
+
+---
+
+License
+
+This project is developed for educational and IoT learning purposes.
