@@ -1,603 +1,357 @@
+// ════════════════════════════════════════════════════════════════
+//  1. CRITICAL CLOUD PROFILE DECLARATIONS (MUST BE FIRST)
+// ════════════════════════════════════════════════════════════════
+#define BLYNK_TEMPLATE_ID   "TMPL34YaDTWgj"
+#define BLYNK_TEMPLATE_NAME "Plant Care System"
+
+// ════════════════════════════════════════════════════════════════
+//  2. SYSTEM LIBRARIES & DEPENDENCIES
+// ════════════════════════════════════════════════════════════════
 #include <DHT.h>
 #include <BH1750.h>
 #include <SD.h>
 #include <SPI.h>
 #include <Wire.h>
 #include <time.h>
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <esp_task_wdt.h> // ESP32 Hardware Watchdog System Engine
 
-#define RELAY_PIN   26
+#include "secrets.h"
+
+// Ensure fallback authentication token is handled cleanly
+#ifndef BLYNK_AUTH_TOKEN
+#define BLYNK_AUTH_TOKEN "AUTH" 
+#endif
+
+// ── HARDWARE PIN DEFINITIONS ─────────────────────────────────────
+#define SERVO_PIN   26  // Drives the physical mechanical water valve gate
 #define BUZZER_PIN  4
 #define SOIL_PIN    34
+#define WATER_PIN   35
 #define DHT_PIN     15
 #define SD_CS_PIN   5
 
-#define BLYNK_TEMPLATE_ID   "TMPL34YaDTWgj"
-#define BLYNK_TEMPLATE_NAME "Plant Care System"
-#define BLYNK_AUTH_TOKEN    AUTH
+// ── HARDWARE PWM SERVO ENGINE CONFIGURATION (ESP32 Core v3.x) ─────
+#define SERVO_PWM_FREQ     50    // Standard analog/digital servo operational frequency (50Hz)
+#define SERVO_PWM_RES      16    // 16-bit high-resolution duty cycle control depth
 
-#include <WiFi.h>
-#include <BlynkSimpleEsp32.h>
-#include "secrets.h"
+// 50Hz frequency frame = 20ms period. 16-bit resolution scale = 65535 total increments.
+// SG90/MG996R standard calibration: 0.5ms pulse = 0 degrees, 2.5ms pulse = 180 degrees.
+#define SERVO_MIN_DUTY     1638  // Counter-clockwise hard physical stop (0.5ms / 20ms * 65535) -> VALVE SHUT
+#define SERVO_MAX_DUTY     8192  // Clockwise hard physical stop (2.5ms / 20ms * 65535) -> VALVE OPEN
+
+// ── SYSTEM CONFIGURATION PARAMETERS ──────────────────────────────
+#define WDT_TIMEOUT_SECONDS 10
+const float ALPHA_FILTER    = 0.15; // Exponential Moving Average Filter Alpha
 
 char ssid[] = WIFI_SSID;
 char pass[] = WIFI_PASS;
 
-// ── Sensor readings ──────────────────────────────────────────────
+// ── MULTI-CORE THREAD SYNCHRONIZATION ────────────────────────────
+portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
+
+// ── SMOOTHED TELEMETRY REGISTERS (Mutex Protected) ────────────────
 float soilMoisture = 45.0;
 float temperature  = 26.5;
 float humidity     = 60.0;
 float lightLux     = 300.0;
-int   healthScore  = 78;
-bool  pumpStatus   = false;
 int   waterLevel   = 80;
+int   healthScore  = 78;
+bool  valveStatus  = false; // Tracks physical position state of the servo valve gate
 
-// ── Control flags ────────────────────────────────────────────────
-bool manualMode       = false;
-bool waterAlertSent   = false;
-bool pumpLocked       = false;
-int  wateringAttempts = 0;
-bool sensorFaultNotified = false;
-unsigned long lastSend      = 0;
-unsigned long pumpStartTime = 0;
-#define MAX_PUMP_TIME 30000
-#define MAX_ATTEMPTS  3
+// ── STORAGE LOGGING CACHE BUFFER ──────────────────────────────────
+float lastLoggedMoisture = -99.0;
+float lastLoggedTemp     = -99.0;
+
+// ── FAULT INTERRUPT FLAGS ─────────────────────────────────────────
+bool valveLocked        = false; // System protective lock constraint flag
+bool sensorFaultAlert   = false;
+bool dhtFaultAlert      = false;
+bool lightFaultAlert    = false;
+bool waterFaultAlert    = false;
+bool sdCardPresent      = false;
+
+// ── TIMING CONTROL VARIABLES ──────────────────────────────────────
+unsigned long valveStartTime = 0;
+unsigned long lastFsmUpdate  = 0;
+int  wateringAttempts        = 0;
+#define MAX_VALVE_TIME       10000 // Hard safety cutoff window at 10 seconds
+#define MAX_ATTEMPTS         3
 float moistureBeforeWatering = 0;
 
-// ── Plant type & thresholds ──────────────────────────────────────
+// ── THRESHOLDS MANAGEMENT PROFILE ─────────────────────────────────
 int   plantType   = 4;
 float moistureMin = 30, moistureMax = 60;
 float tempMin     = 15, tempMax     = 35;
 float humidityMin = 30, humidityMax = 80;
 float lightMin    = 1000, lightMax  = 80000;
 
-// ── Alert flags ──────────────────────────────────────────────────
-bool lightLowAlert         = false;
-bool lightHighAlert        = false;
-bool humidityHighAlert     = false;
-bool humidityLowAlert      = false;
-bool tempHighAlert         = false;
-bool tempLowAlert          = false;
-bool sensorFaultAlert      = false;
-bool dhtFaultAlert         = false;
-bool lightSensorFaultAlert = false;
-bool waterSensorFaultAlert = false;
-bool pumpFaultAlert        = false;
-
-// ── Watering schedule ────────────────────────────────────────────
+// ── SCHEDULER STATE RECOVERY ──────────────────────────────────────
 int  scheduleHour       = 7;
 int  scheduleMinute     = 0;
 bool scheduledWaterDone = false;
 int  lastWateredDay     = -1;
 
-// ── Sensor objects ───────────────────────────────────────────────
-#define DHT_TYPE DHT22
-DHT     dht(DHT_PIN, DHT_TYPE);
+DHT     dht(DHT_PIN, DHT22);
 BH1750  lightMeter;
 
-// ════════════════════════════════════════════════════════════════
-//  THRESHOLDS
-// ════════════════════════════════════════════════════════════════
-void setThresholds() {
-  if (plantType == 1) {
-    moistureMin = 10;  moistureMax = 30;
-    tempMin     = 15;  tempMax     = 40;
-    humidityMin = 20;  humidityMax = 50;
-    lightMin    = 5000; lightMax   = 90000;
-  } else if (plantType == 2) {
-    moistureMin = 50;  moistureMax = 80;
-    tempMin     = 20;  tempMax     = 35;
-    humidityMin = 60;  humidityMax = 90;
-    lightMin    = 1000; lightMax   = 50000;
-  } else if (plantType == 3) {
-    moistureMin = 40;  moistureMax = 70;
-    tempMin     = 18;  tempMax     = 30;
-    humidityMin = 40;  humidityMax = 70;
-    lightMin    = 2000; lightMax   = 60000;
-  } else {
-    moistureMin = 30;  moistureMax = 60;
-    tempMin     = 15;  tempMax     = 35;
-    humidityMin = 30;  humidityMax = 80;
-    lightMin    = 1000; lightMax   = 80000;
-  }
-}
+// Task Forward Declarations
+void criticalCoreLoopTask(void * pvParameters);
+void networkCommunicationTask(void * pvParameters);
+void setThresholds();
+void writeServoAngle(int angle);
 
 // ════════════════════════════════════════════════════════════════
-//  BLYNK CALLBACKS
+//  SETUP EXECUTOR
 // ════════════════════════════════════════════════════════════════
-BLYNK_WRITE(V8) {
-  plantType = param.asInt();
-  setThresholds();
-  Serial.print("Plant type changed: ");
-  Serial.println(plantType);
-}
+void setup() {
+  Serial.begin(115200);
 
-BLYNK_WRITE(V10) {
-  if (param.asInt() == 1) {
-    sensorFaultAlert       = false;
-    wateringAttempts       = 0;
-    pumpLocked             = false;
-    dhtFaultAlert          = false;
-    lightSensorFaultAlert  = false;
-    waterSensorFaultAlert  = false;
-    pumpFaultAlert         = false;
-    sensorFaultNotified    = false;
-    Blynk.virtualWrite(V11, "✅ System reset by user!");
-    Serial.println("System manually reset!");
-  }
-}
+  // Initialize Hardware Watchdog Module using Modern v3.x API Structure
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = WDT_TIMEOUT_SECONDS * 1000,
+    .idle_core_mask = (1 << portNUM_PROCESSORS) - 1, // Monitor both processing cores
+    .trigger_panic = true
+  };
+  esp_task_wdt_init(&wdt_config);
+  esp_task_wdt_add(NULL); // Subscribe main setup path to safety layer
 
-// ════════════════════════════════════════════════════════════════
-//  SETUP SENSORS
-// ════════════════════════════════════════════════════════════════
-void setupSensors() {
-  pinMode(RELAY_PIN, OUTPUT);
+  // Configure Hardware PWM for safe, precise servo movement control using modern v3.x syntax
+  // ledcAttach automatically sets up the pin, frequency, and resolution in one call
+  ledcAttach(SERVO_PIN, SERVO_PWM_FREQ, SERVO_PWM_RES);
+  writeServoAngle(0); // Force valve into a secure, completely closed state immediately at startup
+
   pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, HIGH);
   digitalWrite(BUZZER_PIN, LOW);
 
   dht.begin();
   Wire.begin();
-  lightMeter.begin();
-
-  if (SD.begin(SD_CS_PIN)) {
-    Serial.println("SD Card ready!");
-  } else {
-    Serial.println("SD Card failed!");
+  if (lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE)) {
+    lightFaultAlert = false;
   }
+  sdCardPresent = SD.begin(SD_CS_PIN);
+
+  setThresholds();
+
+  // Spawning Multiprocessing Core Threads to split application layers
+  xTaskCreatePinnedToCore(criticalCoreLoopTask, "Core1_FSM", 8192, NULL, 3, NULL, 1);     // Core 1: Industrial Automation
+  xTaskCreatePinnedToCore(networkCommunicationTask, "Core0_Net", 4192, NULL, 1, NULL, 0); // Core 0: Asynchronous Communication
+
+  esp_task_wdt_reset();
+}
+
+void loop() {
+  vTaskDelete(NULL); // Terminate the generic loop to hand full execution over to FreeRTOS kernels
 }
 
 // ════════════════════════════════════════════════════════════════
-//  READ SENSORS
+//  CORE 1: DETACHED CRITICAL AUTOMATION ENGINE
 // ════════════════════════════════════════════════════════════════
-void readSensors() {
-  int raw = analogRead(SOIL_PIN);
-  soilMoisture = map(raw, 4095, 1500, 0, 100);
-  soilMoisture = constrain(soilMoisture, 0, 100);
+void criticalCoreLoopTask(void * pvParameters) {
+  esp_task_wdt_add(NULL);
+  
+  for (;;) {
+    esp_task_wdt_reset();
+    unsigned long now = millis();
 
-  temperature = dht.readTemperature();
-  humidity    = dht.readHumidity();
-  lightLux    = lightMeter.readLightLevel();
-
-  int waterRaw = analogRead(35);
-  waterLevel = map(waterRaw, 0, 4095, 0, 100);
-  waterLevel = constrain(waterLevel, 0, 100);
-}
-
-// ════════════════════════════════════════════════════════════════
-//  HEALTH SCORE
-// ════════════════════════════════════════════════════════════════
-void calculateHealthScore() {
-  if (isnan(temperature) || isnan(humidity)) {
-    Serial.println("Health score skipped - DHT22 fault!");
-    return;
-  }
-  if (lightLux < 0) {
-    Serial.println("Health score skipped - BH1750 fault!");
-    return;
-  }
-  if (soilMoisture <= 0 || soilMoisture >= 100) {
-    Serial.println("Health score skipped - soil sensor fault!");
-    return;
-  }
-
-  int score = 0;
-
-  // Moisture (40%)
-  if (soilMoisture >= moistureMin && soilMoisture <= moistureMax)
-    score += 40;
-  else if (soilMoisture < moistureMin)
-    score += (int)soilMoisture;
-  else
-    score += 20;
-
-  // Temperature (25%)
-  if (temperature >= tempMin && temperature <= tempMax)
-    score += 25;
-  else
-    score += 10;
-
-  // Humidity (20%)
-  if (humidity >= humidityMin && humidity <= humidityMax)
-    score += 20;
-  else
-    score += 10;
-
-  // Light (15%)
-  if (lightLux >= lightMin && lightLux <= lightMax)
-    score += 15;
-  else
-    score += 5;
-
-  healthScore = score;
-}
-
-// ════════════════════════════════════════════════════════════════
-//  AUTO WATERING
-// ════════════════════════════════════════════════════════════════
-void autoWatering() {
-  if (!manualMode) {
-
-    // Overwatered - LOCK pump (FIX 5: use moistureMax)
-    if (soilMoisture > moistureMax) {
-      pumpLocked = true;
-      pumpStatus = false;
-      digitalWrite(RELAY_PIN, HIGH);
-      Serial.println("Pump LOCKED - soil too wet!");
-      return;
+    // ── STEP 1: SENSOR SIGNAL SMOOTHING PROCESSING (EMA FILTER) ──
+    int rawSoil = analogRead(SOIL_PIN);
+    if (rawSoil > 10 && rawSoil < 4085) {
+      float instantMoisture = map(rawSoil, 4095, 1500, 0, 100);
+      portENTER_CRITICAL(&stateMux);
+      soilMoisture = (ALPHA_FILTER * instantMoisture) + ((1.0 - ALPHA_FILTER) * soilMoisture);
+      soilMoisture = constrain(soilMoisture, 0, 100);
+      portEXIT_CRITICAL(&stateMux);
+      sensorFaultAlert = false;
+    } else {
+      sensorFaultAlert = true;
     }
 
-    // Unlock when dried enough
-    if (pumpLocked && soilMoisture < 40) {
-      pumpLocked = false;
-      Serial.println("Pump UNLOCKED!");
+    float rawTemp = dht.readTemperature();
+    float rawHum  = dht.readHumidity();
+    if (!isnan(rawTemp) && !isnan(rawHum)) {
+      portENTER_CRITICAL(&stateMux);
+      temperature = rawTemp;
+      humidity = rawHum;
+      portEXIT_CRITICAL(&stateMux);
+      dhtFaultAlert = false;
+    } else {
+      dhtFaultAlert = true;
     }
 
-    // Don't water if locked
-    if (pumpLocked) {
-      pumpStatus = false;
-      digitalWrite(RELAY_PIN, HIGH);
-      return;
+    float rawLux = lightMeter.readLightLevel();
+    if (rawLux >= 0 && rawLux < 120000) {
+      lightLux = rawLux;
+      lightFaultAlert = false;
+    } else {
+      lightFaultAlert = true;
     }
 
-    // Sensor fault - stop watering
-    if (sensorFaultAlert) {
-      pumpStatus = false;
-      digitalWrite(RELAY_PIN, HIGH);
-      Serial.println("Pump stopped - sensor fault!");
-      return;
-    }
+    int rawWater = analogRead(WATER_PIN);
+    float instantWater = map(rawWater, 0, 4095, 0, 100);
+    waterLevel = (ALPHA_FILTER * instantWater) + ((1.0 - ALPHA_FILTER) * waterLevel);
+    waterLevel = constrain(waterLevel, 0, 100);
+    waterFaultAlert = (waterLevel <= 0);
 
-    // Normal auto watering
-    if (soilMoisture < moistureMin) {
+    // ── STEP 2: DETERMINISTIC FINITE STATE WATERING AUTOMATION ────
+    if (now - lastFsmUpdate >= 3000) {
+      lastFsmUpdate = now;
 
-      // First time pump turns ON
-      if (pumpStatus == false) {
-        moistureBeforeWatering = soilMoisture;
-        pumpStartTime = millis();
-        wateringAttempts++;
-        Serial.print("Watering attempt: ");
-        Serial.println(wateringAttempts);
+      portENTER_CRITICAL(&stateMux);
+      // Hard Lock Safeguard Boundaries
+      if (soilMoisture > moistureMax || waterLevel < 15 || sensorFaultAlert || dhtFaultAlert) {
+        valveLocked = true;
+        if (valveStatus) {
+          writeServoAngle(0); // Rotate servo back to seal fluid path
+          valveStatus = false;
+        }
+      } else if (soilMoisture < (moistureMin + 5.0)) { 
+        valveLocked = false; // Release lock with built-in hysteresis buffer margin
       }
 
-      pumpStatus = true;
-      digitalWrite(RELAY_PIN, LOW);
+      if (!valveLocked) {
+        if (soilMoisture < moistureMin && !valveStatus) {
+          moistureBeforeWatering = soilMoisture;
+          valveStartTime = now;
+          wateringAttempts++;
+          valveStatus = true;
+          writeServoAngle(90); // Rotate servo to 90 degrees to open fluid path
+        }
+      }
+      portEXIT_CRITICAL(&stateMux);
 
-      // After 30 seconds check moisture change
-      if (millis() - pumpStartTime > MAX_PUMP_TIME) {
-        pumpStatus = false;
-        digitalWrite(RELAY_PIN, HIGH);
-        Serial.println("Pump stopped after 30 seconds");
-
-        float moistureChange = soilMoisture - moistureBeforeWatering;
-        Serial.print("Moisture change: ");
-        Serial.println(moistureChange);
-
-        if (moistureChange < 2.0) {
-          Serial.println("WARNING: Moisture not changing!");
-          if (wateringAttempts >= MAX_ATTEMPTS) {
-            sensorFaultAlert = true;
-            Serial.println("SENSOR FAULT DETECTED!");
+      // ── STEP 3: LOG TO LOCAL STORAGE (DELTA LOG FILTERING) ──────
+      if (sdCardPresent) {
+        if (abs(soilMoisture - lastLoggedMoisture) >= 1.5 || abs(temperature - lastLoggedTemp) >= 0.8) {
+          File file = SD.open("/plantdata.csv", FILE_APPEND);
+          if (file) {
+            file.printf("%lu,%.1f,%.1f,%.1f,%d\n", now, soilMoisture, temperature, lightLux, waterLevel);
+            file.close();
+            lastLoggedMoisture = soilMoisture;
+            lastLoggedTemp = temperature;
+          } else {
+            sdCardPresent = false; // Mark bus dropped on structural write failures
           }
-        } else {
-          wateringAttempts = 0;
-          sensorFaultAlert = false;
-          Serial.println("Moisture changing normally!");
         }
       }
     }
-    else if (soilMoisture > moistureMax) {
-      pumpStatus = false;
-      digitalWrite(RELAY_PIN, HIGH);
-      wateringAttempts = 0;
+
+    // ── STEP 4: EMERGENCY TIMEOUT OVERRIDE SHUTDOWN ──────────────
+    if (valveStatus && (now - valveStartTime >= MAX_VALVE_TIME)) {
+      portENTER_CRITICAL(&stateMux);
+      writeServoAngle(0); // Safely force close the servo valve gate
+      valveStatus = false;
+      portEXIT_CRITICAL(&stateMux);
+
+      float moistureChange = soilMoisture - moistureBeforeWatering;
+      if (moistureChange < 1.5 && wateringAttempts >= MAX_ATTEMPTS) {
+        portENTER_CRITICAL(&stateMux);
+        valveLocked = true; // Hard lockout safety to prevent unmonitored fluid flow
+        portEXIT_CRITICAL(&stateMux);
+      }
     }
+
+    vTaskDelay(pdMS_TO_TICKS(100)); // Relinquish CPU slices to the scheduler
   }
 }
 
 // ════════════════════════════════════════════════════════════════
-//  LOG TO SD
+//  CORE 0: ASYNCHRONOUS NETWORK STACK & CLOUD SYNC TASK
 // ════════════════════════════════════════════════════════════════
-void logToSD() {
-  File file = SD.open("/plantdata.csv", FILE_APPEND);
-  if (file) {
-    file.print(millis());      file.print(",");
-    file.print(soilMoisture);  file.print(",");
-    file.print(temperature);   file.print(",");
-    file.print(humidity);      file.print(",");
-    file.print(lightLux);      file.print(",");
-    file.print(healthScore);   file.print(",");
-    file.println(waterLevel);
-    file.close();
-    Serial.println("Data logged to SD!");
-  } else {
-    Serial.println("SD write failed!");
+void networkCommunicationTask(void * pvParameters) {
+  esp_task_wdt_add(NULL);
+  unsigned long lastNetworkSync = 0;
+  unsigned long exponentialBackoffDelay = 5000;
+
+  WiFi.begin(ssid, pass);
+  Blynk.config(BLYNK_AUTH_TOKEN);
+
+  for (;;) {
+    esp_task_wdt_reset();
+    unsigned long now = millis();
+
+    if (WiFi.status() != WL_CONNECTED) {
+      Blynk.disconnect();
+      vTaskDelay(pdMS_TO_TICKS(exponentialBackoffDelay));
+      if (WiFi.status() != WL_CONNECTED) {
+        WiFi.disconnect();
+        WiFi.begin(ssid, pass);
+        // Exponential backoff strategy optimization capped at 1 minute
+        exponentialBackoffDelay = fmin(exponentialBackoffDelay * 2, 60000);
+      }
+    } else {
+      exponentialBackoffDelay = 5000; // Reset network delay frame tracker
+      if (!Blynk.connected()) {
+        Blynk.connect(2000); // Handshake timeout window boundary to prevent task locks
+      } else {
+        Blynk.run();
+
+        // Control data synchronization cadence independently of automation operations
+        if (now - lastNetworkSync >= 4000) {
+          lastNetworkSync = now;
+
+          portENTER_CRITICAL(&stateMux);
+          Blynk.virtualWrite(V0, soilMoisture);
+          Blynk.virtualWrite(V1, temperature);
+          Blynk.virtualWrite(V2, humidity);
+          Blynk.virtualWrite(V3, lightLux);
+          Blynk.virtualWrite(V5, valveStatus); // Syncs physical gate position with dashboard status indicator
+          Blynk.virtualWrite(V7, waterLevel);
+          portEXIT_CRITICAL(&stateMux);
+
+          // Build Diagnostics Status String Safely
+          String status = "✅ Nominal Sync Active";
+          if (valveLocked) status = "🚨 System Warning Lockout! Check fluid lines or sensors.";
+          if (sensorFaultAlert || dhtFaultAlert) status = "⚠️ Diagnostic Warning: Hardware degradation.";
+          Blynk.virtualWrite(V11, status);
+        }
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
   }
 }
 
 // ════════════════════════════════════════════════════════════════
-//  SYSTEM HEALTH CHECK
+//  SERVO MECHANICAL ANGULAR TRANSLATION INTERFACE (ESP32 Core v3.x)
 // ════════════════════════════════════════════════════════════════
-void checkSystemHealth() {
-  String status = "✅ System OK";
-
-  if (sensorFaultAlert) {
-    status = "⚠️ Soil sensor fault! Check placement.";
-    if (!sensorFaultNotified) {
-      Blynk.logEvent("sensor_fault", "⚠️ Soil sensor faulty! Check placement and press Reset.");
-      sensorFaultNotified = true;
-    }
-  } else {
-    sensorFaultNotified = false;
-  }
-
-  if (isnan(temperature) || isnan(humidity)) {
-    if (!dhtFaultAlert) {
-      Blynk.logEvent("sensor_fault", "⚠️ Temperature sensor faulty! Check DHT22.");
-      dhtFaultAlert = true;
-    }
-    status = "⚠️ Temperature sensor fault! Check DHT22.";
-  } else {
-    dhtFaultAlert = false;
-  }
-
-  if (lightLux < 0) {
-    if (!lightSensorFaultAlert) {
-      Blynk.logEvent("sensor_fault", "⚠️ Light sensor faulty! Check BH1750.");
-      lightSensorFaultAlert = true;
-    }
-    status = "⚠️ Light sensor fault! Check BH1750.";
-  } else {
-    lightSensorFaultAlert = false;
-  }
-
-  if (waterLevel <= 0) {
-    if (!waterSensorFaultAlert) {
-      Blynk.logEvent("sensor_fault", "⚠️ Water sensor faulty! Check wiring.");
-      waterSensorFaultAlert = true;
-      pumpLocked = true;
-    }
-    status = "⚠️ Water sensor fault! Check wiring.";
-  } else {
-    waterSensorFaultAlert = false;
-  }
-
-  if (waterLevel < 10 && waterLevel > 0) {
-    status = "🚨 Water tank empty! Please refill.";
-  }
-
-  if (pumpStatus && (millis() - pumpStartTime > MAX_PUMP_TIME + 5000)) {
-    if (!pumpFaultAlert) {
-      Blynk.logEvent("sensor_fault", "⚠️ Pump may be faulty! Check connection.");
-      pumpFaultAlert = true;
-      pumpLocked     = true;
-      digitalWrite(RELAY_PIN, HIGH);
-      pumpStatus = false;
-      Blynk.virtualWrite(V5, pumpStatus);
-    }
-    status = "⚠️ Pump fault! Pump forced OFF. Check connection.";
-  } else {
-    pumpFaultAlert = false;
-  }
-
-  Blynk.virtualWrite(V11, status);
-  Serial.println(status);
+void writeServoAngle(int angle) {
+  angle = constrain(angle, 0, 180);
+  // Linearly maps input degrees scale directly onto the 16-bit PWM resolution bounds
+  uint32_t duty = SERVO_MIN_DUTY + (((SERVO_MAX_DUTY - SERVO_MIN_DUTY) * angle) / 180);
+  
+  // In ESP32 Core v3.x, ledcWrite accepts the exact GPIO PIN instead of a channel
+  ledcWrite(SERVO_PIN, duty);
 }
 
 // ════════════════════════════════════════════════════════════════
-//  NTP TIME SETUP
+//  THRESHOLD DEFINITIONS LAYER
 // ════════════════════════════════════════════════════════════════
-void setupTime() {
-  configTime(19800, 0, "pool.ntp.org");
-  Serial.print("Waiting for time sync");
-  int retry = 0;
-  struct tm info;
-  while (!getLocalTime(&info) && retry < 20) {
-    delay(500);
-    Serial.print(".");
-    retry++;
-  }
-  if (retry < 20) {
-    Serial.println("\nTime synced!");
+void setThresholds() {
+  if (plantType == 1) {
+    moistureMin = 10; moistureMax = 30; tempMin = 15; tempMax = 40;
+  } else if (plantType == 2) {
+    moistureMin = 50; moistureMax = 80; tempMin = 20; tempMax = 35;
+  } else if (plantType == 3) {
+    moistureMin = 40; moistureMax = 70; tempMin = 18; tempMax = 30;
   } else {
-    Serial.println("\nTime sync FAILED — scheduled watering disabled.");
-    Blynk.virtualWrite(V11, "⚠️ Time sync failed! Scheduled watering disabled.");
+    moistureMin = 30; moistureMax = 60; tempMin = 15; tempMax = 35;
   }
 }
 
-// ════════════════════════════════════════════════════════════════
-//  SCHEDULED WATERING
-// ════════════════════════════════════════════════════════════════
-void checkScheduledWatering() {
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) {
-    Serial.println("Failed to get time");
-    return;
-  }
-
-  // Reset by date not midnight minute
-  if (timeinfo.tm_mday != lastWateredDay) {
-    scheduledWaterDone = false;
-  }
-
-  if (timeinfo.tm_hour  == scheduleHour   &&
-      timeinfo.tm_min   == scheduleMinute  &&
-      !scheduledWaterDone) {
-
-    if (soilMoisture > moistureMax) {
-      Serial.println("Scheduled watering skipped - soil already wet!");
-      scheduledWaterDone = true;
-      lastWateredDay = timeinfo.tm_mday;
-      return;
-    }
-    if (waterLevel < 10) {
-      Serial.println("Scheduled watering skipped - water tank empty!");
-      scheduledWaterDone = true;
-      lastWateredDay = timeinfo.tm_mday;
-      return;
-    }
-    if (sensorFaultAlert) {
-      Serial.println("Scheduled watering skipped - sensor fault!");
-      scheduledWaterDone = true;
-      lastWateredDay = timeinfo.tm_mday;
-      return;
-    }
-    if (pumpLocked) {
-      Serial.println("Scheduled watering skipped - pump locked!");
-      scheduledWaterDone = true;
-      lastWateredDay = timeinfo.tm_mday;
-      return;
-    }
-
-    Serial.println("Scheduled watering started!");
-    digitalWrite(RELAY_PIN, LOW);
-    pumpStatus    = true;
-    pumpStartTime = millis();
-    Blynk.virtualWrite(V5, pumpStatus);
-    scheduledWaterDone = true;
-    lastWateredDay     = timeinfo.tm_mday;
-  }
+// ── INBOUND BLYNK REMOTE DESCENT CALLBACKS ───────────────────────
+BLYNK_WRITE(V8) { 
+  portENTER_CRITICAL(&stateMux);
+  plantType = param.asInt(); 
+  setThresholds(); 
+  portEXIT_CRITICAL(&stateMux);
 }
 
-// ════════════════════════════════════════════════════════════════
-//  SEND DATA TO BLYNK
-// ════════════════════════════════════════════════════════════════
-void sendDataToBlynk() {
-  Blynk.virtualWrite(V0, soilMoisture);
-  Blynk.virtualWrite(V1, temperature);
-  Blynk.virtualWrite(V2, humidity);
-  Blynk.virtualWrite(V3, lightLux);
-  Blynk.virtualWrite(V4, healthScore);
-  Blynk.virtualWrite(V5, pumpStatus);
-  Blynk.virtualWrite(V7, waterLevel);
-
-  Serial.println("---------------------");
-  Serial.print("Soil: ");     Serial.println(soilMoisture);
-  Serial.print("Temp: ");     Serial.println(temperature);
-  Serial.print("Humidity: "); Serial.println(humidity);
-  Serial.print("Light: ");    Serial.println(lightLux);
-  Serial.print("Health: ");   Serial.println(healthScore);
-  Serial.print("Water: ");    Serial.println(waterLevel);
-  Serial.print("Pump: ");     Serial.println(pumpStatus ? "ON" : "OFF");
-}
-
-// ════════════════════════════════════════════════════════════════
-//  ALERTS & TIPS
-// ════════════════════════════════════════════════════════════════
-void checkAlerts() {
-  String tip = "🌱 Plant is doing well!";
-
-  if (soilMoisture > moistureMax) {
-    tip = "🌊 Soil too wet! Pump locked. Waiting for soil to dry...";
-  }
-
-  if (sensorFaultAlert) {
-    tip = "⚠️ Soil sensor may be faulty! Please check placement.";
-  }
-
-  if (waterLevel < 20 && !waterAlertSent) {
-    Blynk.logEvent("water_low", "⚠️ Water tank is low! Please refill.");
-    waterAlertSent = true;
-  }
-  if (waterLevel >= 20) waterAlertSent = false;
-
-  // Light
-  if (lightLux < lightMin) {
-    if (!lightLowAlert) {
-      Blynk.logEvent("light_low", "🌑 Light too low for your plant!");
-      lightLowAlert = true;
-    }
-    tip = "🌑 Move plant to brighter area.";
-  } else if (lightLux > lightMax) {
-    if (!lightHighAlert) {
-      Blynk.logEvent("light_high", "☀️ Too much light! Move plant to shade.");
-      lightHighAlert = true;
-    }
-    tip = "☀️ Too much direct sun. Move to indirect light.";
-  } else {
-    lightLowAlert  = false;
-    lightHighAlert = false;
-  }
-
-  // Humidity
-  if (humidity > humidityMax) {
-    if (!humidityHighAlert) {
-      Blynk.logEvent("humidity_high", "💧 Humidity too high for your plant!");
-      humidityHighAlert = true;
-    }
-    tip = "💧 Humidity high. Ensure good air circulation.";
-  } else if (humidity < humidityMin) {
-    if (!humidityLowAlert) {
-      Blynk.logEvent("humidity_low", "🏜️ Humidity too low for your plant!");
-      humidityLowAlert = true;
-    }
-    tip = "🏜️ Air is dry. Mist leaves occasionally.";
-  } else {
-    humidityHighAlert = false;
-    humidityLowAlert  = false;
-  }
-
-  // Temperature
-  if (temperature > tempMax) {
-    if (!tempHighAlert) {
-      Blynk.logEvent("temp_high", "🌡️ Temperature too high for your plant!");
-      tempHighAlert = true;
-    }
-    tip = "🌡️ Too warm. Move plant to cooler spot.";
-  } else if (temperature < tempMin) {
-    if (!tempLowAlert) {
-      Blynk.logEvent("temp_low", "❄️ Temperature too low for your plant!");
-      tempLowAlert = true;
-    }
-    tip = "❄️ Too cold. Move away from AC or window.";
-  } else {
-    tempHighAlert = false;
-    tempLowAlert  = false;
-  }
-
-  Blynk.virtualWrite(V9, tip);
-}
-
-// ════════════════════════════════════════════════════════════════
-//  SETUP
-// ════════════════════════════════════════════════════════════════
-void setup() {
-  Serial.begin(115200);
-  setupSensors();
-  setupTime();
-  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
-  Serial.println("System Ready!");
-  delay(2000);
-  Blynk.virtualWrite(V11, "🌱 System started! Monitoring your plant...");
-}
-
-// ════════════════════════════════════════════════════════════════
-//  LOOP
-// ════════════════════════════════════════════════════════════════
-void loop() {
-  // WiFi reconnect without blocking
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi disconnected! Reconnecting...");
-    WiFi.reconnect();
-  }
-
-  Blynk.run();
-
-  // Non-blocking pump auto-stop after 10 seconds
-  if (pumpStatus && (millis() - pumpStartTime >= 10000)) {
-    digitalWrite(RELAY_PIN, HIGH);
-    pumpStatus = false;
-    Blynk.virtualWrite(V5, pumpStatus);
-    Serial.println("Pump auto-stopped after 10s.");
-  }
-
-  if (millis() - lastSend > 3000) {
-    lastSend = millis();
-    readSensors();
-    calculateHealthScore();
-    autoWatering();
-    checkScheduledWatering();
-    sendDataToBlynk();
-    checkAlerts();
-    checkSystemHealth();
-    logToSD();
-  }
+BLYNK_WRITE(V10) { 
+  if (param.asInt() == 1) {
+    portENTER_CRITICAL(&stateMux);
+    valveLocked = false; 
+    wateringAttempts = 0; 
+    portEXIT_CRITICAL(&stateMux);
+  } 
 }
